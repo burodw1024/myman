@@ -3,20 +3,23 @@ import re
 import tempfile
 import shutil
 from fastapi import FastAPI, UploadFile, File
-
-import fitz  # PyMuPDF
+import fitz   # PyMuPDF
 import easyocr
 import dateparser
 
-app = FastAPI(title="Stable Invoice OCR - Final Version (GST Both)")
+# ----------------------------------------------------------
+# APP INIT
+# ----------------------------------------------------------
+app = FastAPI(title="Invoice OCR API - PyMuPDF + EasyOCR")
 
+# Load EasyOCR (CPU only)
 reader = easyocr.Reader(["en"], gpu=False)
 
-
 # ----------------------------------------------------------
-# Date Finder
+# Helpers
 # ----------------------------------------------------------
 def find_date_in_window(lines, start_idx, window=6):
+    """Find a date in nearby lines."""
     for i in range(start_idx + 1, min(start_idx + window, len(lines))):
         dt = dateparser.parse(lines[i])
         if dt:
@@ -24,17 +27,15 @@ def find_date_in_window(lines, start_idx, window=6):
     return None
 
 
-# ----------------------------------------------------------
-# Australian Supplier Address Extractor
-# ----------------------------------------------------------
 def extract_supplier_address(lines):
+    """Australian address extractor."""
     address = []
     capturing = False
 
     START = ["level", "suite", "elizabeth"]
-    STREET_WORDS = ["st", "street", "road", "rd", "ave", "avenue"]
-    CITY_WORDS = ["melbourne", "sydney", "brisbane", "perth", "adelaide", "hobart"]
-    STOP = ["customer", "payment", "invoice", "amount", "description", "quantity"]
+    STREET = ["st", "street", "rd", "road", "ave", "avenue"]
+    CITY = ["melbourne", "sydney", "brisbane", "perth", "adelaide", "hobart"]
+    STOP = ["customer", "payment", "invoice", "unit price", "quantity", "description"]
 
     for line in lines:
         low = line.lower()
@@ -49,47 +50,41 @@ def extract_supplier_address(lines):
             break
 
         if (
-            any(s in low for s in START)
-            or any(s in low for s in STREET_WORDS)
-            or any(s in low for s in CITY_WORDS)
-            or "australia" in low
+            any(s in low for s in START) or
+            any(s in low for s in STREET) or
+            any(s in low for s in CITY) or
+            "australia" in low
         ):
             address.append(line)
 
         if "australia" in low:
             break
 
-    return ", ".join(address).replace("  ", " ").strip()
+    return ", ".join(address).strip()
 
 
-# ----------------------------------------------------------
-# ABN Extraction
-# ----------------------------------------------------------
 def extract_abn(text):
+    """Extract ABN number."""
     m = re.search(r"ABN[\s:]*([\d ]{11,20})", text, re.IGNORECASE)
     if m:
         return m.group(1).replace(" ", "")
     return None
 
 
-# ----------------------------------------------------------
-# Multi-line Table Item Extractor
-# ----------------------------------------------------------
 def extract_items(lines):
+    """Safe item extractor supporting simple line items."""
     cleaned = [x.strip() for x in lines if x.strip()]
-
     items = []
     bucket = []
 
     numeric = re.compile(r"^\d+(\.\d{1,2})?$")
     money = re.compile(r"^\d+\.\d{2}$")
-    gst_percent = re.compile(r"^\d+%$")
+    gstp = re.compile(r"^\d+%$")
 
     after_header = False
 
     for line in cleaned:
         low = line.lower()
-
         if "unit price" in low or ("description" in low and "quantity" in low):
             after_header = True
             continue
@@ -102,39 +97,30 @@ def extract_items(lines):
     group = []
     for line in bucket:
         group.append(line)
-
-        nums = [x for x in group if numeric.match(x) or money.match(x) or gst_percent.match(x)]
+        nums = [x for x in group if numeric.match(x) or money.match(x) or gstp.match(x)]
 
         if len(nums) >= 4:
             qty = nums[0]
             unit = nums[1]
-            gstp = nums[2] if gst_percent.match(nums[2]) else None
+            gst = nums[2] if gstp.match(nums[2]) else None
             total = nums[3]
 
-            desc = " ".join([
-                x for x in group
-                if x not in nums
-                and not re.match(r"^(item|description|quantity|gst|amount)", x.lower())
-                and "amount aud" not in x.lower()
-            ]).strip()
+            desc = " ".join([x for x in group if x not in nums and "tixperts-" not in x.lower()]).strip()
 
             items.append({
                 "description": desc,
                 "quantity": qty,
                 "unit_price": unit,
-                "gst_percent": gstp,
+                "gst_percent": gst,
                 "line_total": total
             })
-
             group = []
 
     return items
 
 
-# ----------------------------------------------------------
-# Main Extraction Logic
-# ----------------------------------------------------------
 def extract_invoice_fields(lines):
+    """Extract structured fields from OCR lines."""
     safe = [str(x).strip() for x in lines if str(x).strip()]
     full = " ".join(safe)
 
@@ -147,11 +133,11 @@ def extract_invoice_fields(lines):
         "payment_terms": {}
     }
 
-    # Invoice Number
+    # ---- INVOICE NUMBER ----
     inv = re.findall(r"[A-Z]{2}\.\d{3}-\d{2}\.INV-\d{4}", full)
     data["invoice_details"]["invoice_number"] = inv[0] if inv else None
 
-    # Invoice Date
+    # ---- INVOICE DATE ----
     for idx, line in enumerate(safe):
         if "invoice date" in line.lower():
             data["invoice_details"]["invoice_date"] = find_date_in_window(safe, idx)
@@ -164,11 +150,11 @@ def extract_invoice_fields(lines):
                 data["invoice_details"]["invoice_date"] = dt.strftime("%d %b %Y")
                 break
 
-    # Due Date
-    due = re.search(r"Due Date[:\s]+(\d{1,2} \w+ \d{4})", full)
-    data["invoice_details"]["due_date"] = due.group(1) if due else None
+    # ---- DUE DATE ----
+    dd = re.search(r"Due Date[:\s]+(\d{1,2} \w+ \d{4})", full)
+    data["invoice_details"]["due_date"] = dd.group(1) if dd else None
 
-    # Supplier
+    # ---- SUPPLIER ----
     supplier = None
     for t in safe:
         if "pty" in t.lower():
@@ -179,55 +165,44 @@ def extract_invoice_fields(lines):
     data["supplier"]["address"] = extract_supplier_address(safe)
     data["supplier"]["abn"] = extract_abn(full)
 
-    # Customer
+    # ---- CUSTOMER ----
     for idx, line in enumerate(safe):
         if "customer" in line.lower() and idx + 1 < len(safe):
             data["customer"]["name"] = safe[idx + 1]
             break
 
-    # Items
-    items = extract_items(safe)
-    data["items"] = items
+    # ---- ITEMS ----
+    data["items"] = extract_items(safe)
 
-    # GST amount
+    # ---- GST AMOUNT ----
     gst_amount = None
-
     m = re.search(r"INCLUDES GST[^\d]*([\d]+\.[\d]+)", full, re.IGNORECASE)
     if m:
         gst_amount = float(m.group(1))
-    else:
-        for idx, line in enumerate(safe):
-            if "includes gst" in line.lower():
-                for nxt in safe[idx:idx + 5]:
-                    mm = re.search(r"([\d]+\.[\d]+)", nxt)
-                    if mm:
-                        gst_amount = float(mm.group(1))
-                        break
-                break
 
-    # Total
+    # ---- TOTAL ----
     floats = [float(x) for x in re.findall(r"\b\d+\.\d{2}\b", full)]
     total = floats[-1] if floats else None
 
     data["totals"]["total"] = total
     data["totals"]["gst_amount"] = gst_amount
 
-    # GST percent (first found)
-    gst_percent_val = None
-    for item in items:
-        if item.get("gst_percent"):
-            gst_percent_val = item["gst_percent"]
+    # GST %
+    gst_percent = None
+    for it in data["items"]:
+        if it.get("gst_percent"):
+            gst_percent = it["gst_percent"]
             break
 
-    data["totals"]["gst_percent"] = gst_percent_val
+    data["totals"]["gst_percent"] = gst_percent
 
-    # Subtotal
+    # ---- SUBTOTAL ----
     if total and gst_amount:
         data["totals"]["subtotal"] = round(total - gst_amount, 2)
     else:
         data["totals"]["subtotal"] = None
 
-    # Payment Terms
+    # ---- PAYMENT TERMS ----
     data["payment_terms"]["amount_due"] = total
     data["payment_terms"]["due_date"] = data["invoice_details"]["due_date"]
 
@@ -235,18 +210,18 @@ def extract_invoice_fields(lines):
 
 
 # ----------------------------------------------------------
-# PDF → OCR → JSON  (FITZ VERSION ✔)
+# PDF → IMAGES → OCR
 # ----------------------------------------------------------
 def extract_invoice_text(pdf_path):
+    """Convert PDF pages to images using PyMuPDF then run OCR."""
     lines = []
     doc = fitz.open(pdf_path)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, page in enumerate(doc):
-            pix = page.get_pixmap(dpi=300)
+            pix = page.get_pixmap(dpi=200)
             img_path = os.path.join(tmpdir, f"page_{i}.png")
             pix.save(img_path)
-
             lines.extend(reader.readtext(img_path, detail=0))
 
     return {
@@ -256,7 +231,7 @@ def extract_invoice_text(pdf_path):
 
 
 # ----------------------------------------------------------
-# FastAPI Endpoint
+# API ENDPOINT
 # ----------------------------------------------------------
 @app.post("/extract-invoice")
 async def extract_invoice(file: UploadFile = File(...)):
