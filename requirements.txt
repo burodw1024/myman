@@ -1,10 +1,8 @@
 fastapi
 uvicorn
 gunicorn
+python-multipart
 easyocr
-python-dateutil
-pytz
+pillow
 pymupdf
-opencv-python-headless
-numpy
-torch
+dateparser
