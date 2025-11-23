@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: invoice-ocr-api
+    runtime: docker
+    plan: free
+    region: singapore
+    rootDir: .
+    dockerfilePath: Dockerfile
+    autoDeploy: false
