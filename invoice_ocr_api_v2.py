@@ -3,7 +3,8 @@ import re
 import tempfile
 import shutil
 from fastapi import FastAPI, UploadFile, File
-from pdf2image import convert_from_path
+
+import fitz  # PyMuPDF
 import easyocr
 import dateparser
 
@@ -72,7 +73,7 @@ def extract_abn(text):
 
 
 # ----------------------------------------------------------
-# Multi-line Table Item Extractor (Safe)
+# Multi-line Table Item Extractor
 # ----------------------------------------------------------
 def extract_items(lines):
     cleaned = [x.strip() for x in lines if x.strip()]
@@ -115,7 +116,6 @@ def extract_items(lines):
                 if x not in nums
                 and not re.match(r"^(item|description|quantity|gst|amount)", x.lower())
                 and "amount aud" not in x.lower()
-                and "tixperts-" not in x.lower()
             ]).strip()
 
             items.append({
@@ -179,7 +179,7 @@ def extract_invoice_fields(lines):
     data["supplier"]["address"] = extract_supplier_address(safe)
     data["supplier"]["abn"] = extract_abn(full)
 
-    # Customer Name
+    # Customer
     for idx, line in enumerate(safe):
         if "customer" in line.lower() and idx + 1 < len(safe):
             data["customer"]["name"] = safe[idx + 1]
@@ -189,18 +189,16 @@ def extract_invoice_fields(lines):
     items = extract_items(safe)
     data["items"] = items
 
-    # GST amount (decimal even if on next line)
+    # GST amount
     gst_amount = None
 
-    # first try same-line: "INCLUDES GST 7.73"
     m = re.search(r"INCLUDES GST[^\d]*([\d]+\.[\d]+)", full, re.IGNORECASE)
     if m:
         gst_amount = float(m.group(1))
     else:
-        # look ahead lines after "INCLUDES GST"
         for idx, line in enumerate(safe):
             if "includes gst" in line.lower():
-                for nxt in safe[idx:idx+5]:
+                for nxt in safe[idx:idx + 5]:
                     mm = re.search(r"([\d]+\.[\d]+)", nxt)
                     if mm:
                         gst_amount = float(mm.group(1))
@@ -214,7 +212,7 @@ def extract_invoice_fields(lines):
     data["totals"]["total"] = total
     data["totals"]["gst_amount"] = gst_amount
 
-    # GST Percent
+    # GST percent (first found)
     gst_percent_val = None
     for item in items:
         if item.get("gst_percent"):
@@ -237,16 +235,18 @@ def extract_invoice_fields(lines):
 
 
 # ----------------------------------------------------------
-# PDF → OCR → JSON
+# PDF → OCR → JSON  (FITZ VERSION ✔)
 # ----------------------------------------------------------
 def extract_invoice_text(pdf_path):
-    pages = convert_from_path(pdf_path, dpi=300)
     lines = []
+    doc = fitz.open(pdf_path)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for i, page in enumerate(pages):
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(dpi=300)
             img_path = os.path.join(tmpdir, f"page_{i}.png")
-            page.save(img_path, "PNG")
+            pix.save(img_path)
+
             lines.extend(reader.readtext(img_path, detail=0))
 
     return {
