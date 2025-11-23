@@ -2,9 +2,9 @@ fastapi
 uvicorn
 gunicorn
 easyocr
-python-multipart
-pymupdf==1.23.5
+python-dateutil
+pytz
+pymupdf
 opencv-python-headless
-Pillow
 numpy
-dateparser
+torch
